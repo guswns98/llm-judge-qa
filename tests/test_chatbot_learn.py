@@ -16,6 +16,7 @@ import os
 import json
 import time
 import re
+import statistics
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,6 +32,13 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
 EVAL_DIR = Path("evaluation_results")
+HISTORY_DIR = EVAL_DIR / "history"
+
+# Multi-run Median Aggregation 설정
+EVAL_RUNS = int(os.getenv("EVAL_RUNS", "3"))  # 질문당 평가 반복 횟수
+
+# Score Regression Detection 설정
+REGRESSION_THRESHOLD = float(os.getenv("REGRESSION_THRESHOLD", "0.3"))  # 평균 점수 하락 허용치
 
 # === 150개 질문 리스트 ===
 QUESTIONS = [
@@ -195,8 +203,8 @@ QUESTIONS = [
 ]
 
 
-def evaluate_with_ollama(question: str, response: str, index: int) -> dict:
-    """Ollama를 이용하여 챗봇 응답 품질을 평가"""
+def _single_evaluate(question: str, response: str) -> tuple[int, str]:
+    """단일 Ollama 평가 호출. (score, evaluation_text) 반환"""
     prompt = f"""당신은 금융 챗봇의 응답 품질을 평가하는 전문 평가자입니다.
 
 아래 평가 기준에 따라 점수를 매기고, 근거를 간략히 설명해주세요.
@@ -226,27 +234,45 @@ def evaluate_with_ollama(question: str, response: str, index: int) -> dict:
         )
         resp.raise_for_status()
         result_text = resp.json().get("response", "")
-
-        # 점수 파싱
         score = _parse_score(result_text)
-
-        return {
-            "index": index,
-            "question": question,
-            "response": response,
-            "score": score,
-            "evaluation": result_text.strip(),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        return score, result_text.strip()
     except Exception as e:
-        return {
-            "index": index,
-            "question": question,
-            "response": response,
-            "score": 0,
-            "evaluation": f"평가 실패: {str(e)}",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        return 0, f"평가 실패: {str(e)}"
+
+
+def evaluate_with_ollama(question: str, response: str, index: int) -> dict:
+    """Multi-run Median Aggregation: N회 반복 평가 후 중앙값을 최종 점수로 채택"""
+    run_scores = []
+    run_evaluations = []
+
+    for run in range(EVAL_RUNS):
+        score, evaluation = _single_evaluate(question, response)
+        run_scores.append(score)
+        run_evaluations.append(evaluation)
+
+    # 유효 점수(0 제외)로 중앙값 계산, 유효 점수가 없으면 0
+    valid_run_scores = [s for s in run_scores if s > 0]
+    if valid_run_scores:
+        median_score = int(statistics.median(valid_run_scores))
+    else:
+        median_score = 0
+
+    # 중앙값에 해당하는 평가 근거를 대표로 선택
+    representative_eval = run_evaluations[0]
+    for i, s in enumerate(run_scores):
+        if s == median_score:
+            representative_eval = run_evaluations[i]
+            break
+
+    return {
+        "index": index,
+        "question": question,
+        "response": response,
+        "score": median_score,
+        "run_scores": run_scores,
+        "evaluation": representative_eval,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def _parse_score(text: str) -> int:
@@ -260,15 +286,63 @@ def _parse_score(text: str) -> int:
     return int(match.group()) if match else 0
 
 
+def _load_previous_summary() -> dict | None:
+    """이력 디렉토리에서 가장 최근 평가 요약을 로드"""
+    if not HISTORY_DIR.exists():
+        return None
+    history_files = sorted(HISTORY_DIR.glob("summary_*.json"))
+    if not history_files:
+        return None
+    with open(history_files[-1], "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _detect_regression(current_summary: dict, previous_summary: dict) -> dict:
+    """이전 평가 이력과 비교하여 점수 회귀를 감지"""
+    curr_avg = current_summary["average_score"]
+    prev_avg = previous_summary["average_score"]
+    diff = round(curr_avg - prev_avg, 2)
+
+    # 카테고리별 회귀 분석 (질문 인덱스 기준)
+    curr_by_idx = {r["index"]: r["score"] for r in current_summary["results"]}
+    prev_by_idx = {r["index"]: r["score"] for r in previous_summary["results"]}
+
+    regressed_questions = []
+    for idx in sorted(set(curr_by_idx) & set(prev_by_idx)):
+        score_diff = curr_by_idx[idx] - prev_by_idx[idx]
+        if score_diff <= -2:  # 2점 이상 하락한 질문
+            regressed_questions.append({
+                "index": idx,
+                "previous_score": prev_by_idx[idx],
+                "current_score": curr_by_idx[idx],
+                "drop": score_diff,
+            })
+
+    is_regression = diff < -REGRESSION_THRESHOLD
+
+    return {
+        "previous_avg": prev_avg,
+        "current_avg": curr_avg,
+        "diff": diff,
+        "is_regression": is_regression,
+        "threshold": REGRESSION_THRESHOLD,
+        "previous_run": previous_summary.get("run_id", "unknown"),
+        "regressed_questions": regressed_questions,
+    }
+
+
 class TestChatbotEvaluation:
     """챗봇 150개 질문 자동 평가 테스트"""
 
     def test_chatbot_quality_evaluation(self, auth_page):
-        """150개 질문을 전송하고 Ollama로 응답 품질을 평가"""
+        """150개 질문을 전송하고 Ollama로 응답 품질을 평가 (Multi-run Median + Regression Detection)"""
         EVAL_DIR.mkdir(exist_ok=True)
+        HISTORY_DIR.mkdir(exist_ok=True)
         chatbot = ChatbotPage(auth_page, BASE_URL)
         chatbot.navigate("/")
         chatbot.open_chatbot()
+
+        run_id = time.strftime("%Y%m%d_%H%M%S")
 
         results = []
         eval_futures = []
@@ -285,18 +359,19 @@ class TestChatbotEvaluation:
                 # 응답 저장
                 chatbot.save_result(i, question, response)
 
-                # Ollama 평가 (백그라운드 스레드)
+                # Ollama 평가 (백그라운드 스레드, N회 반복 후 중앙값)
                 future = executor.submit(evaluate_with_ollama, question, response, i)
                 eval_futures.append(future)
 
             # 모든 평가 완료 대기
-            print("\n[INFO] Ollama 평가 결과 수집 중...")
+            print(f"\n[INFO] Ollama 평가 결과 수집 중... (질문당 {EVAL_RUNS}회 반복, median 집계)")
             for future in as_completed(eval_futures):
                 eval_result = future.result()
                 results.append(eval_result)
                 score = eval_result["score"]
                 idx = eval_result["index"]
-                print(f"  평가 완료 #{idx}: {score}점")
+                run_scores = eval_result.get("run_scores", [])
+                print(f"  평가 완료 #{idx}: {score}점 (runs: {run_scores})")
 
                 # 개별 평가 결과 저장
                 eval_path = EVAL_DIR / f"eval_{idx:03d}.json"
@@ -314,6 +389,9 @@ class TestChatbotEvaluation:
         avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0
 
         summary = {
+            "run_id": run_id,
+            "eval_runs_per_question": EVAL_RUNS,
+            "aggregation_method": "median",
             "total_questions": len(QUESTIONS),
             "evaluated": len(valid_scores),
             "average_score": round(avg_score, 2),
@@ -324,19 +402,60 @@ class TestChatbotEvaluation:
             "results": results,
         }
 
-        # 통합 결과 저장
+        # === Score Regression Detection ===
+        previous = _load_previous_summary()
+        regression_result = None
+        if previous:
+            regression_result = _detect_regression(summary, previous)
+            summary["regression"] = regression_result
+
+        # 통합 결과 저장 (latest)
         summary_path = EVAL_DIR / "evaluation_summary.json"
         summary_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-        print(f"\n{'='*50}")
+        # 이력 저장 (타임스탬프별)
+        history_path = HISTORY_DIR / f"summary_{run_id}.json"
+        history_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 결과 출력
+        print(f"\n{'='*60}")
         print(f"평가 완료: {len(valid_scores)}/{len(QUESTIONS)}개")
-        print(f"평균 점수: {avg_score:.2f}/5.00")
+        print(f"평균 점수: {avg_score:.2f}/5.00 (질문당 {EVAL_RUNS}회 median)")
         print(f"점수 분포: {summary['score_distribution']}")
         print(f"결과 저장: {summary_path}")
-        print(f"{'='*50}")
+        print(f"이력 저장: {history_path}")
 
-        # 평균 점수 2.0 이상이면 테스트 통과
-        assert avg_score >= 2.0, f"평균 점수가 기준(2.0) 미만입니다: {avg_score:.2f}"
+        if regression_result:
+            diff = regression_result["diff"]
+            arrow = "▼" if diff < 0 else "▲" if diff > 0 else "─"
+            print(f"\n[Regression Detection]")
+            print(f"  이전 평균: {regression_result['previous_avg']:.2f}")
+            print(f"  현재 평균: {regression_result['current_avg']:.2f}")
+            print(f"  변동: {arrow} {abs(diff):.2f}")
+            if regression_result["regressed_questions"]:
+                print(f"  급락 질문({len(regression_result['regressed_questions'])}개):")
+                for rq in regression_result["regressed_questions"]:
+                    print(f"    #{rq['index']}: {rq['previous_score']}→{rq['current_score']} ({rq['drop']:+d})")
+            if regression_result["is_regression"]:
+                print(f"  ⚠ 점수 회귀 감지! (하락폭 {abs(diff):.2f} > 임계값 {REGRESSION_THRESHOLD})")
+            else:
+                print(f"  ✓ 회귀 없음 (임계값: {REGRESSION_THRESHOLD})")
+        else:
+            print("\n[Regression Detection] 이전 이력 없음 — 첫 번째 실행")
+
+        print(f"{'='*60}")
+
+        # 절대 기준 + 회귀 기준 모두 체크
+        assert avg_score >= 2.0, f"평균 점수가 절대 기준(2.0) 미만입니다: {avg_score:.2f}"
+        if regression_result and regression_result["is_regression"]:
+            pytest.fail(
+                f"점수 회귀 감지: 평균 {regression_result['previous_avg']:.2f} → "
+                f"{regression_result['current_avg']:.2f} "
+                f"(하락폭 {abs(regression_result['diff']):.2f} > 임계값 {REGRESSION_THRESHOLD})"
+            )
