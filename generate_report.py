@@ -62,6 +62,10 @@ def generate_html(results: list[dict]) -> str:
 
     eval_runs = summary.get("eval_runs_per_question", 1) if summary else 1
     regression = summary.get("regression") if summary else None
+    avg_relevance = summary.get("average_relevance", 0) if summary else 0
+    avg_accuracy = summary.get("average_accuracy", 0) if summary else 0
+    avg_completeness = summary.get("average_completeness", 0) if summary else 0
+    weights = summary.get("weights", {}) if summary else {}
 
     def score_color(score):
         colors = {5: "#22c55e", 4: "#84cc16", 3: "#eab308", 2: "#f97316", 1: "#ef4444", 0: "#9ca3af"}
@@ -74,18 +78,23 @@ def generate_html(results: list[dict]) -> str:
         color = score_color(r["score"])
         run_scores = r.get("run_scores", [])
         run_info = f' title="runs: {run_scores}"' if run_scores else ""
+        rel = r.get("relevance", 0)
+        acc = r.get("accuracy", 0)
+        comp = r.get("completeness", 0)
         rows += f"""
         <tr>
             <td style="text-align:center">{r['index']}</td>
             <td>{r['question']}</td>
-            <td style="max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
-                title="{r['response'][:200].replace('"', '&quot;')}">{r['response'][:100]}</td>
+            <td style="max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                title="{r['response'][:200].replace('"', '&quot;')}">{r['response'][:80]}</td>
             <td style="text-align:center"{run_info}>
                 <span style="background:{color}; color:white; padding:2px 10px; border-radius:12px; font-weight:bold;">
                     {r['score']}
                 </span>
-                {'<div style="font-size:0.7em; color:#888; margin-top:2px;">' + ','.join(str(s) for s in run_scores) + '</div>' if run_scores else ''}
             </td>
+            <td style="text-align:center"><span style="background:{score_color(rel)}; color:white; padding:2px 8px; border-radius:12px;">{rel}</span></td>
+            <td style="text-align:center"><span style="background:{score_color(acc)}; color:white; padding:2px 8px; border-radius:12px;">{acc}</span></td>
+            <td style="text-align:center"><span style="background:{score_color(comp)}; color:white; padding:2px 8px; border-radius:12px;">{comp}</span></td>
             <td style="font-size:0.85em; color:#555;">{r['evaluation'][:150]}</td>
         </tr>"""
 
@@ -232,7 +241,7 @@ def generate_html(results: list[dict]) -> str:
 <body>
     <div class="container">
         <h1>Quantus 챗봇 응답 품질 리포트</h1>
-        <p class="subtitle">LLM-as-a-Judge 자동 평가 결과 (Ollama {OLLAMA_MODEL}) | 질문당 {eval_runs}회 반복 Median 집계</p>
+        <p class="subtitle">LLM-as-a-Judge 3축 독립 평가 (Ollama {OLLAMA_MODEL}) | 관련성·정확성·완결성 가중평균 | 질문당 {eval_runs}회 반복 Median</p>
 
         <div class="cards">
             <div class="card">
@@ -240,16 +249,20 @@ def generate_html(results: list[dict]) -> str:
                 <div class="card-value">{total}</div>
             </div>
             <div class="card">
-                <div class="card-label">평균 점수 (median)</div>
+                <div class="card-label">종합 점수 (가중평균)</div>
                 <div class="card-value" style="color:{score_color(round(avg_score))}">{avg_score:.2f}</div>
             </div>
             <div class="card">
-                <div class="card-label">평가 완료</div>
-                <div class="card-value">{len(valid_scores)}</div>
+                <div class="card-label">관련성 평균{' (×' + str(weights.get('relevance', 1.0)) + ')' if weights else ''}</div>
+                <div class="card-value" style="color:{score_color(round(avg_relevance))}">{avg_relevance:.2f}</div>
             </div>
             <div class="card">
-                <div class="card-label">반복 횟수</div>
-                <div class="card-value">{eval_runs}회</div>
+                <div class="card-label">정확성 평균{' (×' + str(weights.get('accuracy', 1.5)) + ')' if weights else ''}</div>
+                <div class="card-value" style="color:{score_color(round(avg_accuracy))}">{avg_accuracy:.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">완결성 평균{' (×' + str(weights.get('completeness', 1.0)) + ')' if weights else ''}</div>
+                <div class="card-value" style="color:{score_color(round(avg_completeness))}">{avg_completeness:.2f}</div>
             </div>
             <div class="card">
                 <div class="card-label">4점 이상 비율</div>
@@ -269,16 +282,19 @@ def generate_html(results: list[dict]) -> str:
         <div class="section">
             <h2 style="margin-bottom:12px;">상세 평가 결과</h2>
             <p style="font-size:0.85em; color:#64748b; margin-bottom:8px;">
-                점수 아래 작은 숫자는 각 반복 실행의 개별 점수입니다 (median 기반 최종 점수)
+                관련성·정확성·완결성 3축 독립 채점 후 가중 평균으로 종합 점수 산출 (median 기반)
             </p>
             <div style="overflow-x:auto;">
                 <table>
                     <thead>
                         <tr>
-                            <th style="width:50px">#</th>
-                            <th style="width:200px">질문</th>
-                            <th style="width:300px">챗봇 응답</th>
-                            <th style="width:80px">점수</th>
+                            <th style="width:40px">#</th>
+                            <th style="width:160px">질문</th>
+                            <th style="width:240px">챗봇 응답</th>
+                            <th style="width:60px">종합</th>
+                            <th style="width:60px">관련성</th>
+                            <th style="width:60px">정확성</th>
+                            <th style="width:60px">완결성</th>
                             <th>평가 근거</th>
                         </tr>
                     </thead>

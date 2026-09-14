@@ -40,6 +40,13 @@ EVAL_RUNS = int(os.getenv("EVAL_RUNS", "3"))  # 질문당 평가 반복 횟수
 # Score Regression Detection 설정
 REGRESSION_THRESHOLD = float(os.getenv("REGRESSION_THRESHOLD", "0.3"))  # 평균 점수 하락 허용치
 
+# 3축 평가 가중치
+WEIGHT_RELEVANCE = float(os.getenv("WEIGHT_RELEVANCE", "1.0"))
+WEIGHT_ACCURACY = float(os.getenv("WEIGHT_ACCURACY", "1.5"))
+WEIGHT_COMPLETENESS = float(os.getenv("WEIGHT_COMPLETENESS", "1.0"))
+
+AXES = ["relevance", "accuracy", "completeness"]
+
 # === 150개 질문 리스트 ===
 QUESTIONS = [
     # 기본 인사 및 서비스 안내 (1-10)
@@ -203,18 +210,26 @@ QUESTIONS = [
 ]
 
 
-def _single_evaluate(question: str, response: str) -> tuple[int, str]:
-    """단일 Ollama 평가 호출. (score, evaluation_text) 반환"""
+def _single_evaluate(question: str, response: str) -> tuple[dict, str]:
+    """단일 Ollama 평가 호출. (axis_scores, evaluation_text) 반환"""
     prompt = f"""당신은 금융 챗봇의 응답 품질을 평가하는 전문 평가자입니다.
 
-아래 평가 기준에 따라 점수를 매기고, 근거를 간략히 설명해주세요.
+아래 3가지 축에 대해 각각 독립적으로 1-5점을 평가하고, 근거를 한 줄로 설명하세요.
 
-평가 기준:
-- 5점: 관련성·정확성·완결성 완벽, 구체적이고 유용한 정보 제공
-- 4점: 대부분 충족하나 설명이 다소 부족함
-- 3점: 관련성은 있으나 정확성 또는 완결성 중 하나가 미흡함
-- 2점: 관련은 있으나 답변이 불충분하거나 일부 오류가 있음
-- 1점: 질문과 무관하거나 에러 메시지만 반환함
+[관련성] 질문에 대한 응답의 관련 정도
+- 5점: 질문의 의도를 정확히 파악하고 직접적으로 관련된 정보 제공
+- 3점: 주제와 관련은 있으나 질문의 핵심을 벗어남
+- 1점: 질문과 완전히 무관하거나 에러 메시지만 반환
+
+[정확성] 제공된 정보의 사실적 정확성
+- 5점: 모든 정보가 사실적으로 정확하며 오류 없음
+- 3점: 대체로 맞지만 일부 부정확한 정보 포함
+- 1점: 심각한 사실 오류 또는 근거 없는 정보(할루시네이션)
+
+[완결성] 답변의 충분함과 구체성
+- 5점: 필요한 정보를 빠짐없이 구체적으로 제공
+- 3점: 기본적인 답변은 하지만 세부 내용이 부족
+- 1점: 답변이 극히 불충분하거나 빈 응답
 
 [질문]
 {question}
@@ -223,7 +238,9 @@ def _single_evaluate(question: str, response: str) -> tuple[int, str]:
 {response}
 
 아래 형식으로만 답변하세요:
-점수: (1-5)
+관련성: (1-5)
+정확성: (1-5)
+완결성: (1-5)
 근거: (한 줄 설명)"""
 
     try:
@@ -234,33 +251,35 @@ def _single_evaluate(question: str, response: str) -> tuple[int, str]:
         )
         resp.raise_for_status()
         result_text = resp.json().get("response", "")
-        score = _parse_score(result_text)
-        return score, result_text.strip()
+        axis_scores = _parse_axis_scores(result_text)
+        return axis_scores, result_text.strip()
     except Exception as e:
-        return 0, f"평가 실패: {str(e)}"
+        return {"relevance": 0, "accuracy": 0, "completeness": 0}, f"평가 실패: {str(e)}"
 
 
 def evaluate_with_ollama(question: str, response: str, index: int) -> dict:
-    """Multi-run Median Aggregation: N회 반복 평가 후 중앙값을 최종 점수로 채택"""
-    run_scores = []
+    """Multi-run Median Aggregation: N회 반복 평가 후 축별 중앙값을 최종 점수로 채택"""
+    run_axis_scores = []
     run_evaluations = []
 
     for run in range(EVAL_RUNS):
-        score, evaluation = _single_evaluate(question, response)
-        run_scores.append(score)
+        axis_scores, evaluation = _single_evaluate(question, response)
+        run_axis_scores.append(axis_scores)
         run_evaluations.append(evaluation)
 
-    # 유효 점수(0 제외)로 중앙값 계산, 유효 점수가 없으면 0
-    valid_run_scores = [s for s in run_scores if s > 0]
-    if valid_run_scores:
-        median_score = int(statistics.median(valid_run_scores))
-    else:
-        median_score = 0
+    # 축별 중앙값 계산
+    median_axes = {}
+    for axis in AXES:
+        valid = [s[axis] for s in run_axis_scores if s[axis] > 0]
+        median_axes[axis] = int(statistics.median(valid)) if valid else 0
 
-    # 중앙값에 해당하는 평가 근거를 대표로 선택
+    composite = _compute_composite(median_axes)
+    score_int = round(composite)
+
+    # 대표 평가 근거 선택
     representative_eval = run_evaluations[0]
-    for i, s in enumerate(run_scores):
-        if s == median_score:
+    for i, s in enumerate(run_axis_scores):
+        if all(s[axis] == median_axes[axis] for axis in AXES):
             representative_eval = run_evaluations[i]
             break
 
@@ -268,22 +287,51 @@ def evaluate_with_ollama(question: str, response: str, index: int) -> dict:
         "index": index,
         "question": question,
         "response": response,
-        "score": median_score,
-        "run_scores": run_scores,
+        "score": score_int,
+        "composite_score": composite,
+        "relevance": median_axes["relevance"],
+        "accuracy": median_axes["accuracy"],
+        "completeness": median_axes["completeness"],
+        "run_axis_scores": run_axis_scores,
+        "run_scores": [round(_compute_composite(s)) for s in run_axis_scores],
         "evaluation": representative_eval,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 def _parse_score(text: str) -> int:
-    """평가 텍스트에서 점수 추출"""
+    """평가 텍스트에서 점수 추출 (하위 호환용)"""
     match = re.search(r"점수\s*:\s*(\d)", text)
     if match:
         score = int(match.group(1))
         return min(max(score, 1), 5)
-    # fallback: 첫 번째 숫자 추출
     match = re.search(r"[1-5]", text)
     return int(match.group()) if match else 0
+
+
+def _parse_axis_scores(text: str) -> dict:
+    """평가 텍스트에서 3축 점수 추출"""
+    labels = {"relevance": "관련성", "accuracy": "정확성", "completeness": "완결성"}
+    scores = {}
+    for axis, label in labels.items():
+        match = re.search(rf"{label}\s*:\s*(\d)", text)
+        if match:
+            scores[axis] = min(max(int(match.group(1)), 1), 5)
+        else:
+            scores[axis] = 0
+    return scores
+
+
+def _compute_composite(axis_scores: dict) -> float:
+    """가중 평균 종합 점수 계산"""
+    weights = {
+        "relevance": WEIGHT_RELEVANCE,
+        "accuracy": WEIGHT_ACCURACY,
+        "completeness": WEIGHT_COMPLETENESS,
+    }
+    total_weight = sum(weights.values())
+    weighted_sum = sum(axis_scores[axis] * weights[axis] for axis in weights)
+    return round(weighted_sum / total_weight, 2)
 
 
 def _load_previous_summary() -> dict | None:
@@ -371,7 +419,10 @@ class TestChatbotEvaluation:
                 score = eval_result["score"]
                 idx = eval_result["index"]
                 run_scores = eval_result.get("run_scores", [])
-                print(f"  평가 완료 #{idx}: {score}점 (runs: {run_scores})")
+                r_s = eval_result.get("relevance", 0)
+                a_s = eval_result.get("accuracy", 0)
+                c_s = eval_result.get("completeness", 0)
+                print(f"  평가 완료 #{idx}: 종합 {score}점 (관련:{r_s} 정확:{a_s} 완결:{c_s} | runs: {run_scores})")
 
                 # 개별 평가 결과 저장
                 eval_path = EVAL_DIR / f"eval_{idx:03d}.json"
@@ -385,8 +436,15 @@ class TestChatbotEvaluation:
 
         # 결과 요약
         results.sort(key=lambda x: x["index"])
-        valid_scores = [r["score"] for r in results if r["score"] > 0]
+        valid_results = [r for r in results if r["score"] > 0]
+        valid_scores = [r["score"] for r in valid_results]
         avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+
+        # 축별 평균
+        axis_avgs = {}
+        for axis in AXES:
+            vals = [r[axis] for r in valid_results if r.get(axis, 0) > 0]
+            axis_avgs[axis] = round(sum(vals) / len(vals), 2) if vals else 0
 
         summary = {
             "run_id": run_id,
@@ -395,6 +453,14 @@ class TestChatbotEvaluation:
             "total_questions": len(QUESTIONS),
             "evaluated": len(valid_scores),
             "average_score": round(avg_score, 2),
+            "average_relevance": axis_avgs["relevance"],
+            "average_accuracy": axis_avgs["accuracy"],
+            "average_completeness": axis_avgs["completeness"],
+            "weights": {
+                "relevance": WEIGHT_RELEVANCE,
+                "accuracy": WEIGHT_ACCURACY,
+                "completeness": WEIGHT_COMPLETENESS,
+            },
             "score_distribution": {
                 str(s): len([r for r in results if r["score"] == s])
                 for s in range(1, 6)
@@ -426,7 +492,9 @@ class TestChatbotEvaluation:
         # 결과 출력
         print(f"\n{'='*60}")
         print(f"평가 완료: {len(valid_scores)}/{len(QUESTIONS)}개")
-        print(f"평균 점수: {avg_score:.2f}/5.00 (질문당 {EVAL_RUNS}회 median)")
+        print(f"종합 점수: {avg_score:.2f}/5.00 (질문당 {EVAL_RUNS}회 median)")
+        print(f"축별 평균: 관련성 {axis_avgs['relevance']:.2f} | 정확성 {axis_avgs['accuracy']:.2f} | 완결성 {axis_avgs['completeness']:.2f}")
+        print(f"가중치: 관련성 {WEIGHT_RELEVANCE} | 정확성 {WEIGHT_ACCURACY} | 완결성 {WEIGHT_COMPLETENESS}")
         print(f"점수 분포: {summary['score_distribution']}")
         print(f"결과 저장: {summary_path}")
         print(f"이력 저장: {history_path}")
