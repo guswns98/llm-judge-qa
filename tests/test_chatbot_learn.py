@@ -346,7 +346,7 @@ def _load_previous_summary() -> dict | None:
 
 
 def _detect_regression(current_summary: dict, previous_summary: dict) -> dict:
-    """이전 평가 이력과 비교하여 점수 회귀를 감지"""
+    """이전 평가 이력과 비교하여 종합 + 축별 점수 회귀를 감지"""
     curr_avg = current_summary["average_score"]
     prev_avg = previous_summary["average_score"]
     diff = round(curr_avg - prev_avg, 2)
@@ -358,7 +358,7 @@ def _detect_regression(current_summary: dict, previous_summary: dict) -> dict:
     regressed_questions = []
     for idx in sorted(set(curr_by_idx) & set(prev_by_idx)):
         score_diff = curr_by_idx[idx] - prev_by_idx[idx]
-        if score_diff <= -2:  # 2점 이상 하락한 질문
+        if score_diff <= -2:
             regressed_questions.append({
                 "index": idx,
                 "previous_score": prev_by_idx[idx],
@@ -366,7 +366,23 @@ def _detect_regression(current_summary: dict, previous_summary: dict) -> dict:
                 "drop": score_diff,
             })
 
+    # 축별 회귀 감지
+    axis_regression = {}
+    for axis in AXES:
+        curr_axis_avg = current_summary.get(f"average_{axis}", 0)
+        prev_axis_avg = previous_summary.get(f"average_{axis}", 0)
+        axis_diff = round(curr_axis_avg - prev_axis_avg, 2)
+        axis_regression[axis] = {
+            "previous_avg": prev_axis_avg,
+            "current_avg": curr_axis_avg,
+            "diff": axis_diff,
+            "is_regression": axis_diff < -REGRESSION_THRESHOLD,
+        }
+
     is_regression = diff < -REGRESSION_THRESHOLD
+    axis_regressions_detected = [
+        axis for axis, r in axis_regression.items() if r["is_regression"]
+    ]
 
     return {
         "previous_avg": prev_avg,
@@ -376,6 +392,8 @@ def _detect_regression(current_summary: dict, previous_summary: dict) -> dict:
         "threshold": REGRESSION_THRESHOLD,
         "previous_run": previous_summary.get("run_id", "unknown"),
         "regressed_questions": regressed_questions,
+        "axis_regression": axis_regression,
+        "axis_regressions_detected": axis_regressions_detected,
     }
 
 
@@ -511,9 +529,17 @@ class TestChatbotEvaluation:
                 for rq in regression_result["regressed_questions"]:
                     print(f"    #{rq['index']}: {rq['previous_score']}→{rq['current_score']} ({rq['drop']:+d})")
             if regression_result["is_regression"]:
-                print(f"  ⚠ 점수 회귀 감지! (하락폭 {abs(diff):.2f} > 임계값 {REGRESSION_THRESHOLD})")
+                print(f"  ⚠ 종합 점수 회귀 감지! (하락폭 {abs(diff):.2f} > 임계값 {REGRESSION_THRESHOLD})")
             else:
-                print(f"  ✓ 회귀 없음 (임계값: {REGRESSION_THRESHOLD})")
+                print(f"  ✓ 종합 회귀 없음 (임계값: {REGRESSION_THRESHOLD})")
+
+            # 축별 회귀 출력
+            axis_labels = {"relevance": "관련성", "accuracy": "정확성", "completeness": "완결성"}
+            for axis, ar in regression_result.get("axis_regression", {}).items():
+                a_diff = ar["diff"]
+                a_arrow = "▼" if a_diff < 0 else "▲" if a_diff > 0 else "─"
+                status = "⚠ 회귀!" if ar["is_regression"] else "✓"
+                print(f"  [{axis_labels[axis]}] {ar['previous_avg']:.2f} → {ar['current_avg']:.2f} ({a_arrow}{abs(a_diff):.2f}) {status}")
         else:
             print("\n[Regression Detection] 이전 이력 없음 — 첫 번째 실행")
 
@@ -523,7 +549,11 @@ class TestChatbotEvaluation:
         assert avg_score >= 2.0, f"평균 점수가 절대 기준(2.0) 미만입니다: {avg_score:.2f}"
         if regression_result and regression_result["is_regression"]:
             pytest.fail(
-                f"점수 회귀 감지: 평균 {regression_result['previous_avg']:.2f} → "
+                f"종합 점수 회귀 감지: 평균 {regression_result['previous_avg']:.2f} → "
                 f"{regression_result['current_avg']:.2f} "
                 f"(하락폭 {abs(regression_result['diff']):.2f} > 임계값 {REGRESSION_THRESHOLD})"
             )
+        if regression_result and regression_result.get("axis_regressions_detected"):
+            axis_labels = {"relevance": "관련성", "accuracy": "정확성", "completeness": "완결성"}
+            failed_axes = [axis_labels[a] for a in regression_result["axis_regressions_detected"]]
+            pytest.fail(f"축별 회귀 감지: {', '.join(failed_axes)} (임계값 {REGRESSION_THRESHOLD})")

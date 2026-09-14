@@ -50,6 +50,43 @@ def load_history() -> list[dict]:
     return history
 
 
+def _axis_regression_html(regression: dict) -> str:
+    """축별 회귀 감지 HTML 생성"""
+    axis_reg = regression.get("axis_regression", {})
+    if not axis_reg:
+        return ""
+    labels = {"relevance": "관련성", "accuracy": "정확성", "completeness": "완결성"}
+    rows = ""
+    for axis in ["relevance", "accuracy", "completeness"]:
+        ar = axis_reg.get(axis, {})
+        if not ar:
+            continue
+        d = ar.get("diff", 0)
+        color = "#ef4444" if d < 0 else "#22c55e" if d > 0 else "#9ca3af"
+        arrow = "&#9660;" if d < 0 else "&#9650;" if d > 0 else "&#9472;"
+        badge = ""
+        if ar.get("is_regression"):
+            badge = ' <span style="background:#ef4444; color:white; padding:1px 8px; border-radius:8px; font-size:0.75em;">REGRESSION</span>'
+        rows += f"""
+            <tr>
+                <td style="font-weight:600;">{labels[axis]}</td>
+                <td style="text-align:center">{ar.get('previous_avg', 0):.2f}</td>
+                <td style="text-align:center; color:{color};">{arrow} {abs(d):.2f}</td>
+                <td style="text-align:center">{ar.get('current_avg', 0):.2f}</td>
+                <td>{badge}</td>
+            </tr>"""
+    return f"""
+            <div style="margin-top:8px;">
+                <h3 style="font-size:0.95em; margin-bottom:8px;">축별 회귀 분석</h3>
+                <table style="width:auto;">
+                    <thead><tr>
+                        <th>축</th><th>이전</th><th>변동</th><th>현재</th><th></th>
+                    </tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>"""
+
+
 def generate_html(results: list[dict]) -> str:
     """평가 결과를 HTML 리포트로 변환 (Multi-run + Regression 포함)"""
     summary = load_summary()
@@ -166,9 +203,10 @@ def generate_html(results: list[dict]) -> str:
                            border-radius:12px; font-weight:bold; font-size:0.9em;">{status}</span>
                 </div>
             </div>
-            <p style="font-size:0.85em; color:#64748b;">
+            <p style="font-size:0.85em; color:#64748b; margin-bottom:12px;">
                 임계값: {regression['threshold']} | 이전 실행: {regression['previous_run']}
             </p>
+            {_axis_regression_html(regression)}
             {regressed_table}
         </div>"""
 
